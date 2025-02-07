@@ -5,6 +5,7 @@ import pyspark.sql.types as T
 import pyspark.sql.functions as F 
 from pyspark.storagelevel import StorageLevel
 import argparse 
+from dateutil import parser
 
 def get_args():
     parser = argparse.ArgumentParser()
@@ -15,6 +16,20 @@ def get_args():
         help="Pass the absolute path to the s3 raw data location until year partition",
         type=str
     )
+    parser.add_argument(
+        "--start-date-hour", "-s",
+        dest="start_date",
+        required=True,
+        help="Pass the start date in YYYY-MM-DD HH format",
+        type=str
+    )
+    parser.add_argument(
+        "--end-date-hour", "-e",
+        dest="end_date",
+        required=True,
+        help="Pass the end date in YYYY-MM-DD HH format",
+        type=str
+    )
     args = parser.parse_args()
     return args
 
@@ -22,7 +37,7 @@ def get_file_paths(base_path: str, year: int, month: int, day_start: int, day_en
     try:
         paths = []
 
-        for day in range(day_start, day_end):
+        for day in range(day_start, day_end+1):
             for hour in range(hour_start, hour_end):
                 path = f"{base_path}year={year}/month={month:02d}/day={day:02d}/hour={hour:02d}"
                 paths.append(path)
@@ -42,7 +57,7 @@ def get_tables(raw_data_path: str) -> tuple:
     cs_active = f"{catalog}.{db}.offer_eligibility_snapshots_current_state_active"
     cs_inactive = f"{catalog}.{db}.offer_eligibility_snapshots_current_state_inactive"
     saved_offers = f"{catalog}.{db}.saved_offers"    
-    if "kafka_stream" in raw_data_path:
+    if "kafka-stream" in raw_data_path:
         raw_offer_elig = f"{raw_offer_elig}_kafka"
         stg_offer_elig = f"{stg_offer_elig}_kafka"
         cs_active = f"{cs_active}_kafka"
@@ -90,6 +105,8 @@ def create_table(spark, tablename, df, partition_columns=None):
 def main(spark, args):
 
     base_path = args.raw_data
+    start_date = parser.parse(args.start_date)
+    end_date = parser.parse(args.end_date)
 
     catalog_tables = get_tables(base_path)
     raw_data_origin = catalog_tables['raw_data_origin']
@@ -102,15 +119,15 @@ def main(spark, args):
     saved_offers = catalog_tables['saved_offers']
 
     # Read in incremental data
-    # TODO: Pass this as arguments to the job or build a metadata layer to handle last processed 
-    # dates and desired wait time
+    # TODO: Build a metadata layer to handle last processed dates and desired wait time
+    #       Refactor for a better date calculation logic
     paths = get_file_paths(
-        year=2024,
-        month=12,
-        day_start=25,
-        day_end=26,
-        hour_start=12,
-        hour_end=13,
+        year=start_date.year,
+        month=start_date.month,
+        day_start=start_date.day,
+        hour_start=start_date.hour,
+        day_end=end_date.day,
+        hour_end=end_date.hour,
         base_path=base_path
     )
 
@@ -123,13 +140,13 @@ def main(spark, args):
         .withColumn("hour", F.regexp_extract("file_path", r"hour=(\d{2})", 1).cast("int"))
 
     # Load incremental data to raw table 
-
     # spark.sql(f'drop table {raw_offer_elig}')
     create_table(spark=spark, tablename=raw_offer_elig, df=df, partition_columns=["year", "month", "day", "hour"])
     df.write.format("iceberg")\
         .mode("overwrite")\
-        .insertInto(raw_offer_elig)
-
+        .partitionBy("year", "month", "day", "hour")\
+        .option("partitionOverwriteMode", "dynamic")\
+        .save(raw_offer_elig)
 
     # Get current anc historic batchid
     # TODO UPDATE Batchid to match with end time of run window
@@ -140,19 +157,21 @@ def main(spark, args):
     print(batch_id, hist_batch_id)
 
 
-    # STAGE Table with offers and progress data flattened and deduped
-    df_stage = df.select('payload')
-    df_stage = df_stage.withColumn("user_id", F.get_json_object(F.col("payload"), "$.userId")) \
-           .withColumn("offers", F.get_json_object(F.col("payload"), "$.offers")) \
-           .withColumn("updated_ts", F.get_json_object(F.col("payload"), "$.updated"))
-    # Unpack Offers
-    df_stage = df_stage.select(
-            F.col("user_id"),
-            F.explode(F.from_json(F.col("offers"), T.ArrayType(T.MapType(T.StringType(), T.StringType())))).alias("offers"),
-            F.col("updated_ts")
-    )
     # Set aliases and unpack progress
     if raw_data_origin == 'legacy':
+
+        # STAGE Table with offers and progress data flattened and deduped
+        df_stage = df.select('payload')
+        df_stage = df_stage.withColumn("user_id", F.get_json_object(F.col("payload"), "$.userId")) \
+            .withColumn("offers", F.get_json_object(F.col("payload"), "$.offers")) \
+            .withColumn("updated_ts", F.get_json_object(F.col("payload"), "$.updated"))
+        # Unpack Offers
+        df_stage = df_stage.select(
+                F.col("user_id"),
+                F.explode(F.from_json(F.col("offers"), T.ArrayType(T.MapType(T.StringType(), T.StringType())))).alias("offers"),
+                F.col("updated_ts")
+        )
+
         df_stage = df_stage.select(
             F.col("user_id"),
             F.col("updated_ts"),
@@ -169,50 +188,76 @@ def main(spark, args):
             F.col("offers.progress").alias("progress"),
             F.from_json(F.col("offers.progress").alias("progress"), T.MapType(T.StringType(), T.StringType())).alias('progress_parsed')
         )
-    
+        # Standardize timestamps and unpack progress
+        df_stage = df_stage.select(
+            F.col("user_id"),
+            F.from_unixtime(F.col('updated_ts')/1000, "yyyy-MM-dd HH:mm:ss").alias('updated_ts'),
+            F.col("offer_id"),
+            F.from_unixtime(F.col('creation_time')/1000, "yyyy-MM-dd HH:mm:ss").alias('creation_time'),
+            F.col("audience"),
+            F.col("bandit_status"),
+            F.col("experiment_status"),
+            F.col("holdout"),
+            F.from_unixtime(F.col('invalidation_time')/1000, "yyyy-MM-dd HH:mm:ss").alias('invalidation_time'),
+            F.from_unixtime(F.col('start_time')/1000, "yyyy-MM-dd HH:mm:ss").alias('start_time'),
+            F.from_unixtime(F.col('end_time')/1000, "yyyy-MM-dd HH:mm:ss").alias('end_time'),
+            F.col("potentially_eligible_in_future"),
+            F.col("progress_parsed.type").alias("progress_type"),
+            F.col("progress_parsed.uses").alias("progress_uses"),
+            F.col("progress_parsed.dollars").alias("progress_dollars"),
+            F.col("progress_parsed.dollarsRequired").alias("progress_dollars_required"),
+            F.col("progress_parsed.maxUses").alias("progress_max_uses"),
+            F.col("progress_parsed.percentage").alias("progress_percentage"),
+            F.col("progress_parsed.quantity").alias("progress_quantity"),
+            F.col("progress_parsed.quantityRequired").alias("progress_quantity_required")
+        )    
     elif raw_data_origin == 'kafka':
+        # Unpack Offers
+        df_stage = df.select(
+            F.col("user_id"),
+            F.explode(F.col("offers")).alias("offers"),
+            F.col("updated_timestamp_ms").alias("updated_ts")
+        )
         # KAFKA STREAMS DO NOT HAVE bandit status and experiment status
         # This block is just to handle that
         df_stage = df_stage.select(
             F.col("user_id"),
             F.col("updated_ts"),
-            F.col("offers.offerId").alias("offer_id"),
-            F.col("offers.creationTime").alias("creation_time"),
+            F.col("offers.offer_id").alias("offer_id"),
+            F.col("offers.creation_timestamp_ms").alias("creation_time"),
             F.col("offers.audience").alias("audience"),
-            F.lit("NULL").alias("bandit_status"),
-            F.lit("NULL").alias("experiment_status"),
+            F.lit("NULL").alias("bandit_status"), # Not present in Kafka Streams
+            F.lit("NULL").alias("experiment_status"), # Not present in Kafka Streams
             F.col("offers.holdout").alias("holdout"),
-            F.col("offers.invalidationTime").alias("invalidation_time"),
-            F.col("offers.startTime").alias("start_time"),
-            F.col("offers.endTime").alias("end_time"),
-            F.col("offers.potentiallyEligibleInFuture").alias("potentially_eligible_in_future"),
-            F.col("offers.progress").alias("progress"),
-            F.from_json(F.col("offers.progress").alias("progress"), T.MapType(T.StringType(), T.StringType())).alias('progress_parsed')
+            F.col("offers.invalidation_timestamp_ms").alias("invalidation_time"),
+            F.col("offers.start_timestamp_ms").alias("start_time"),
+            F.col("offers.end_timestamp_ms").alias("end_time"),
+            F.col("offers.potentially_eligible_in_future").alias("potentially_eligible_in_future"),
+            F.col("offers.progress").alias("progress_parsed"),
         )
+        df_stage = df_stage.select(
+            F.col("user_id"),
+            F.from_unixtime(F.col('updated_ts')/1000, "yyyy-MM-dd HH:mm:ss").alias('updated_ts'),
+            F.col("offer_id"),
+            F.from_unixtime(F.col('creation_time')/1000, "yyyy-MM-dd HH:mm:ss").alias('creation_time'),
+            F.col("audience"),
+            F.col("bandit_status"),
+            F.col("experiment_status"),
+            F.col("holdout"),
+            F.from_unixtime(F.col('invalidation_time')/1000, "yyyy-MM-dd HH:mm:ss").alias('invalidation_time'),
+            F.from_unixtime(F.col('start_time')/1000, "yyyy-MM-dd HH:mm:ss").alias('start_time'),
+            F.from_unixtime(F.col('end_time')/1000, "yyyy-MM-dd HH:mm:ss").alias('end_time'),
+            F.col("potentially_eligible_in_future"),
+            F.col("progress_parsed.type").alias("progress_type"),
+            F.col("progress_parsed.uses").alias("progress_uses"),
+            F.col("progress_parsed.dollars").alias("progress_dollars"),
+            F.col("progress_parsed.dollars_required").alias("progress_dollars_required"),
+            F.col("progress_parsed.max_uses").alias("progress_max_uses"),
+            F.col("progress_parsed.percentage").alias("progress_percentage"),
+            F.col("progress_parsed.quantity").alias("progress_quantity"),
+            F.col("progress_parsed.quantity_required").alias("progress_quantity_required")
+        )        
 
-    # Standardize timestamps and unpack progress
-    df_stage = df_stage.select(
-        F.col("user_id"),
-        F.from_unixtime(F.col('updated_ts')/1000, "yyyy-MM-dd HH:mm:ss").alias('updated_ts'),
-        F.col("offer_id"),
-        F.from_unixtime(F.col('creation_time')/1000, "yyyy-MM-dd HH:mm:ss").alias('creation_time'),
-        F.col("audience"),
-        F.col("bandit_status"),
-        F.col("experiment_status"),
-        F.col("holdout"),
-        F.from_unixtime(F.col('invalidation_time')/1000, "yyyy-MM-dd HH:mm:ss").alias('invalidation_time'),
-        F.from_unixtime(F.col('start_time')/1000, "yyyy-MM-dd HH:mm:ss").alias('start_time'),
-        F.from_unixtime(F.col('end_time')/1000, "yyyy-MM-dd HH:mm:ss").alias('end_time'),
-        F.col("potentially_eligible_in_future"),
-        F.col("progress_parsed.type").alias("progress_type"),
-        F.col("progress_parsed.uses").alias("progress_uses"),
-        F.col("progress_parsed.dollars").alias("progress_dollars"),
-        F.col("progress_parsed.dollarsRequired").alias("progress_dollars_required"),
-        F.col("progress_parsed.maxUses").alias("progress_max_uses"),
-        F.col("progress_parsed.percentage").alias("progress_percentage"),
-        F.col("progress_parsed.quantity").alias("progress_quantity"),
-        F.col("progress_parsed.quantityRequired").alias("progress_quantity_required")
-    )
 
     # Dedupe staged data
     df_stage.createOrReplaceTempView("df_stage")
@@ -405,7 +450,8 @@ def main(spark, args):
     df_for_merge = df_for_merge.withColumn("expiry_status", F.lit('active'))
     df_for_merge = df_for_merge.withColumn("batch_id", F.lit(batch_id))
 
-    spark.sql(f"ALTER TABLE {cs_active} CREATE BRANCH incr_branch")
+    spark.sql(f"ALTER TABLE {cs_active} DROP BRANCH IF EXISTS incr_branch")
+    spark.sql(f"ALTER TABLE {cs_active} CREATE BRANCH IF NOT EXISTS incr_branch")
     spark.sql("SET spark.wap.branch = incr_branch")
 
     df_for_merge.createOrReplaceTempView('incr_elig_updates')
@@ -491,11 +537,9 @@ def main(spark, args):
     spark.sql(f"CALL fetch_dl.system.rewrite_manifests(table => '{cs_active}')")
     spark.sql(f"CALL fetch_dl.system.rewrite_position_delete_files(table => '{cs_active}', where => 'batch_id={batch_id}', options => map('max-concurrent-file-group-rewrites', '1000'))")
 
-
-
-
     # Stop Spark session
     spark.stop()
+    return True
 
 
 if __name__ == '__main__':
