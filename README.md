@@ -6,7 +6,8 @@
 - Add spark-submit step to corresponding EMR cluster
 
 ## Legacy Job
-```spark-submit 
+```
+spark-submit 
     --deploy-mode cluster 
     --conf spark.executor.memory=32g 
     --conf spark.executor.memory.overhead=3g 
@@ -22,7 +23,8 @@
     <absolutePathToJobScript>/offer-eligiblity.v1.py --raw-data s3://data-lake-857967394368-us-east-1-prod/data/stream/offer-service/offer-eligibility-snapshots/landing/
 ```
 ## Kafka Job (With run window)
-```spark-submit 
+```
+spark-submit 
     --deploy-mode cluster 
     --conf spark.executor.memory=32g 
     --conf spark.executor.memory.overhead=3g 
