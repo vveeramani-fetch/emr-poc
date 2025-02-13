@@ -1,4 +1,6 @@
 #!/bin/env python
+# Applicable only to the legacy current state
+
 from pyspark.sql import SparkSession
 import datetime
 import pyspark.sql.types as T 
@@ -30,10 +32,9 @@ def get_args():
     return args
 
 # TODO USE dataclasses instead of dictionary
-def get_tables(raw_data_path: str) -> tuple:
+def get_tables(raw_data_path: str, pipetype: str) -> tuple:
     catalog = "fetch_dl"
     db = "offers_prod"
-    raw_data_origin = 'legacy'
     sf_cs_dump = f"{catalog}.{db}.sf_offer_eligibility_cs_dump"
     raw_offer_elig = f"{catalog}.{db}.raw_offer_eligibility_snapshots"
     stg_offer_elig = f"{catalog}.{db}.stg_offer_eligibility_snapshots"
@@ -41,15 +42,6 @@ def get_tables(raw_data_path: str) -> tuple:
     cs_active = f"{catalog}.{db}.offer_eligibility_snapshots_current_state_active"
     cs_inactive = f"{catalog}.{db}.offer_eligibility_snapshots_current_state_inactive"
     saved_offers = f"{catalog}.{db}.saved_offers"    
-    if "kafka-stream" in raw_data_path:
-        raw_offer_elig = f"{raw_offer_elig}_kafka"
-        stg_offer_elig = f"{stg_offer_elig}_kafka"
-        cs_active = f"{cs_active}_kafka"
-        cs_inactive = f"{cs_inactive}_kafka"
-        saved_offers = f"{saved_offers}_kafka"
-        sf_cs_dump = f"{sf_cs_dump}_kafka"
-        int_cs_w_expiry = f"{int_cs_w_expiry}_kafka"
-        raw_data_origin = 'kafka'
     return {
         'catalog': catalog,
         'db': db,
@@ -66,9 +58,10 @@ def get_tables(raw_data_path: str) -> tuple:
 def main(spark, args):
 
     base_path = args.raw_data
+    pipe_type = args.pipe_type
     batch_id = base_path.split('/')[-1].split('=')[1]
 
-    catalog_tables = get_tables(base_path)
+    catalog_tables = get_tables(base_path, pipe_type)
     raw_data_origin = catalog_tables['raw_data_origin']
     catalog = catalog_tables['catalog']
     db = catalog_tables['db']
@@ -83,7 +76,7 @@ def main(spark, args):
     logger.info(f'Writing to Raw Iceberg Table: {sf_dump}')
     # write to iceberg table
     df=spark.read.parquet(base_path)
-    df.write.format("iceberg").save(sf_dump)
+    df.write.format("iceberg").mode('overwrite').save(sf_dump)
 
     logger.info(f'Setting up table with expiry: {sf_dump_int}')
     # Create Table with expiry
