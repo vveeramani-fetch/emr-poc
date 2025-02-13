@@ -6,6 +6,16 @@ import pyspark.sql.functions as F
 from pyspark.storagelevel import StorageLevel
 import argparse 
 from dateutil import parser
+import logging
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+log_format = '%(asctime)s [%(levelname)s] %(funcName)s: %(message)s'
+date_format = '%Y-%m-%d %H:%M:%S' 
+console_handler = logging.StreamHandler()
+formatter = logging.Formatter(log_format, datefmt=date_format)
+console_handler.setFormatter(formatter)
+logger.addHandler(console_handler)
 
 def get_args():
     parser = argparse.ArgumentParser()
@@ -70,10 +80,12 @@ def main(spark, args):
     cs_inactive = catalog_tables['cs_inactive']
     saved_offers = catalog_tables['saved_offers']
 
+    logger.info(f'Writing to Raw Iceberg Table: {sf_dump}')
     # write to iceberg table
     df=spark.read.parquet(base_path)
     df.write.format("iceberg").save(sf_dump)
 
+    logger.info(f'Setting up table with expiry: {sf_dump_int}')
     # Create Table with expiry
     spark.sql(f"""
         CREATE TABLE IF NOT EXISTS {sf_dump_int}
@@ -87,6 +99,7 @@ def main(spark, args):
         LEFT JOIN {saved_offers} t2 ON (t1.offer_id = t2.offer_id)
     """)
 
+    logger.info(f'Setting up Active CS: {cs_active}')
     # Create Active Table
     spark.sql(f"""
         CREATE TABLE IF NOT EXISTS {cs_active} 
@@ -104,6 +117,7 @@ def main(spark, args):
         WHERE expiry_status != 'expired'
     """)
 
+    logger.info(f'Setting up Expired CS: {cs_inactive}')
     # Create Inactive Table
     spark.sql(f"""
         CREATE TABLE IF NOT EXISTS {cs_inactive} 
@@ -121,6 +135,7 @@ def main(spark, args):
         WHERE expiry_status = 'expired'
     """)
 
+    logger.info(f'Closing Session')
     # Stop Spark session
     spark.stop()
     return True
