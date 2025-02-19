@@ -41,3 +41,11 @@ spark-submit
     <absolutePathToJobScript>/offer-eligiblity.v1.py --raw-data s3://data-lake-857967394368-us-east-1-prod/data/stream/offer-service/offer-eligibility-snapshots/landing/ --raw-data s3://data-lake-857967394368-us-east-1-prod/data/kafka-stream/offer-eligibility-snapshots/ -s "2025-01-15 20" -e "2024-01-15 21"
 
 ```
+## Infrastructure Details
+### Cluster Config
+Instance Type: r6gd.16xlarge
+
+Instance Count: 2-40 (ONDemand Core Nodes with EMR Autoscaling)
+
+### IAM Role/Permissions
+Replicate or use the role ***arn:aws:iam::094506541504:role/luigi-tests-default-service-role-55373c9***
